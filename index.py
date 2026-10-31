@@ -32,9 +32,12 @@ INTERVALO_IMPRESION = int(os.getenv('INTERVALO_IMPRESION', 30)) # Cada 30 seg
 MAX_SIZE = int(os.getenv('MAX_SIZE', 40)) # Ancho máximo para impresión
 ISLAS = os.getenv('ISLAS')
 ISLA_CIERRE = os.getenv('ISLA_CIERRE')
-# --- CONFIGURACIÓN MIFACT ---
-MIFACT_API_URL = os.getenv('MIFACT_API')
-MIFACT_TOKEN = os.getenv('MIFACT_TOKEN')
+
+MESES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+         "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+def formatear_fecha(dt_obj):
+    return f"{dt_obj.day:02d} {MESES[dt_obj.month]} {dt_obj.year} {dt_obj.strftime('%H:%M:%S')}"
 
 def obtener_conexion():
     return pyodbc.connect(
@@ -50,12 +53,12 @@ def proceso_impresion():
         try:
             conn = obtener_conexion()
             cursor = conn.cursor()
-            
+
             # Buscar comprobantes NO impresos (impreso = 0)
 
             query = f"""
-                    SELECT id, CASE tipo_comprobante WHEN '01' THEN 'FACTURA ELECTRONICA' WHEN '03' THEN 'BOLETA ELECTRONICA' WHEN '07' THEN 'NOTA DE CREDITO ELECTRONICA' WHEN '08' THEN 'NOTA DE DEBITO ELECTRONICA' WHEN '50' THEN 'NOTA DE DESPACHO' WHEN '51' THEN 'CALIBRACION' WHEN '52' THEN 'NOTA INTERNA' END as tipo_comprobante, numeracion_comprobante, placa, fecha_emision, gravadas, total, igv, cadena_para_codigo_qr, codigo_hash, ReceptorId, UsuarioId 
-                    FROM Comprobantes  c 
+                    SELECT id, CASE tipo_comprobante WHEN '01' THEN 'FACTURA ELECTRONICA' WHEN '03' THEN 'BOLETA ELECTRONICA' WHEN '07' THEN 'NOTA DE CREDITO ELECTRONICA' WHEN '08' THEN 'NOTA DE DEBITO ELECTRONICA' WHEN '50' THEN 'NOTA DE DESPACHO' WHEN '51' THEN 'CALIBRACION' WHEN '52' THEN 'NOTA INTERNA' END as tipo_comprobante, numeracion_comprobante, placa, fecha_hora, gravadas, total, igv, cadena_para_codigo_qr, codigo_hash, ReceptorId, UsuarioId, tipo_comprobante as codigo_tipo, IslaId as isla_id, pistola as pistola_num
+                    FROM Comprobantes  c
                     WHERE (impresion = 0 or impresion is null) AND IslaID IN ({ISLAS}) order by id desc"""
             cursor.execute(query)
             pendientes = cursor.fetchall()
@@ -63,7 +66,7 @@ def proceso_impresion():
             for comp in pendientes:
                 with lock_impresora:
                     print(f"📄 Imprimiendo: {comp.numeracion_comprobante}")
-                    
+
                     cursor.execute("SELECT CASE WHEN tipo_documento = '0' THEN 'DNI' WHEN tipo_documento = '1' THEN 'CARNET DE EXTRANJERIA' WHEN tipo_documento = '4' THEN 'CARNET DE IDENTIDAD' WHEN tipo_documento = '6' THEN 'RUC' ELSE 'OTRO' END as tipo_documento, numero_documento, razon_social, direccion, correo FROM Receptores WHERE id = ?", comp.ReceptorId)
                     receptor = cursor.fetchone()
                     cursor.execute("SELECT * FROM Items WHERE ComprobanteId = ?", comp.id)
@@ -71,7 +74,7 @@ def proceso_impresion():
                     cursor.execute("SELECT * FROM Usuarios WHERE id = ?", comp.UsuarioId)
                     usuario = cursor.fetchone()
 
-                    # La función imprimir_comprobante usará comp.cadena_para_codigo_qr 
+                    # La función imprimir_comprobante usará comp.cadena_para_codigo_qr
                     # si ya existe (porque el hilo 1 terminó) o el QR por defecto (si no ha terminado)
                     if imprimir_comprobante(comp, items, receptor, usuario):
                         cursor.execute("UPDATE Comprobantes SET impresion = 1 WHERE id = ?", comp.id)
@@ -82,7 +85,7 @@ def proceso_impresion():
             print(f"❌ Error en hilo Impresión: {e}")
         finally:
             if conn: conn.close()
-            
+
         time.sleep(INTERVALO_IMPRESION)
 
 # --- PROCESO 3: IMPRESIÓN DE CIERRES ---
@@ -93,12 +96,12 @@ def proceso_cierres():
         try:
             conn = obtener_conexion()
             cursor = conn.cursor()
-            
+
             # 1. Buscar Cierres de Turno pendientes
             # Nota: Asumo que agregaste una columna 'impresion' a Cierreturnos
             query_turnos = """
-                SELECT id, total, fecha, fecha_inicio, turno, isla, efectivo, tarjeta, yape, CierrediaId, UsuarioId 
-                FROM Cierreturnos 
+                SELECT id, total, fecha, fecha_inicio, turno, isla, efectivo, tarjeta, yape, CierrediaId, UsuarioId
+                FROM Cierreturnos
                 WHERE (impresion = 0 OR impresion IS NULL) and isla = ?
             """
             cursor.execute(query_turnos, ISLA_CIERRE)
@@ -119,9 +122,23 @@ def proceso_cierres():
                     cursor.execute("SELECT * FROM Gastos WHERE CierreturnoId = ?", turno.id)
                     gastos = cursor.fetchall()
 
-                    cursor.execute("SELECT r.razon_social, p.nombre, c.volumen, c.total FROM Comprobantes c INNER JOIN Receptores r ON c.ReceptorId = r.id INNER JOIN Productos p ON c.codigo_combustible = p.id WHERE c.tipo_comprobante = '50' and CierreturnoId = ?", turno.id)
+                    # OJO: codigo_combustible corresponde a Productos.codigo, NO a Productos.id.
+                    # Si no se encuentra, se usa la descripcion del Item como respaldo.
+                    # LEFT JOIN para que la nota salga aunque le falte el receptor.
+                    cursor.execute("""
+                        SELECT ISNULL(r.razon_social, 'SIN CLIENTE') as razon_social,
+                               COALESCE((SELECT TOP 1 p.nombre FROM Productos p WHERE p.codigo = c.codigo_combustible),
+                                        (SELECT TOP 1 i.descripcion FROM Items i WHERE i.ComprobanteId = c.id),
+                                        CAST(c.codigo_combustible AS VARCHAR(20)),
+                                        '-') as nombre,
+                               ISNULL(c.volumen, 0) as volumen,
+                               ISNULL(c.total, 0) as total
+                        FROM Comprobantes c
+                        LEFT JOIN Receptores r ON c.ReceptorId = r.id
+                        WHERE c.tipo_comprobante = '50' AND c.CierreturnoId = ?""", turno.id)
                     despachos = cursor.fetchall()
-                    
+                    print(f"   -> Notas de despacho encontradas para el turno {turno.id}: {len(despachos)}")
+
                     print(f"🖨️ Imprimiendo Cierre Turno: {turno.turno} - Isla: {turno.isla}")
                     if imprimir_ticket_cierre_turno(turno, usuario, detalles, depositos, gastos, despachos):
                         cursor.execute("UPDATE Cierreturnos SET impresion = 1 WHERE id = ?", turno.id)
@@ -140,13 +157,15 @@ def proceso_cierres():
             print(f"❌ Error en hilo Cierres: {e}")
         finally:
             if conn: conn.close()
-        
-        time.sleep(INTERVALO_IMPRESION) # Revisar cierres cada minuto        
+
+        time.sleep(INTERVALO_IMPRESION) # Revisar cierres cada minuto
 
 def imprimir_comprobante(comprobante, items, receptor, usuario):
+    dt_obj = datetime.fromisoformat(comprobante.fecha_hora)
+    fecha_hora = formatear_fecha(dt_obj)
     p = None
     try:
-        p = Usb(ID_VENDOR, ID_PRODUCT, profile="TM-T88V")        
+        p = Usb(ID_VENDOR, ID_PRODUCT, profile="TM-T88V")
         # Encabezado de la Gasolinera
         p.set(align='center', bold=True, width=2, height=2)
         p.text(f"{EMP_CONFIG['rs']}\n")
@@ -158,13 +177,24 @@ def imprimir_comprobante(comprobante, items, receptor, usuario):
 
         # Datos del Cliente
         p.set(align='left')
+        # Isla y pistola donde se abastecio (sirve al reimprimir el ticket en otra isla)
+        isla_num = getattr(comprobante, 'isla_id', None)
+        pistola_num = getattr(comprobante, 'pistola_num', None)
+        if isla_num:
+            p.set(bold=True)
+            if pistola_num:
+                p.text(f"ISLA {isla_num} - P{pistola_num}\n")
+            else:
+                # pistola = 0 significa venta que no salio de un surtidor (balon de gas, aceite, etc.)
+                p.text(f"ISLA {isla_num}\n")
+            p.set(bold=False)
         p.text(f"CLIENTE: {receptor.razon_social[:30]}\n")
         p.text(f"{receptor.tipo_documento}: {receptor.numero_documento}\n")
         if receptor.tipo_documento == "RUC":
-            p.text(f"DIRECCION: {receptor.direccion[:30]}\n")  
+            p.text(f"DIRECCION: {receptor.direccion[:30]}\n")
         if comprobante.placa:
             p.text(f"PLACA: {comprobante.placa}\n")
-        p.text(f"FECHA: {comprobante.fecha_emision}\n")
+        p.text(f"FECHA: {fecha_hora}\n")
         p.text(f"USUARIO: {usuario.nombre[:30]}\n")
         p.text("-" * MAX_SIZE + "\n")
 
@@ -186,7 +216,13 @@ def imprimir_comprobante(comprobante, items, receptor, usuario):
 
         # Código QR y Hash
         p.set(align='center')
-        if comprobante.cadena_para_codigo_qr:
+        # Las NOTAS DE DESPACHO (tipo 50) no llevan QR: va [ND] en grande y negrita
+        es_nota_despacho = str(getattr(comprobante, 'codigo_tipo', '') or '').strip() == '50'
+        if es_nota_despacho:
+            p.set(align='center', bold=True, custom_size=True, width=4, height=4, smooth=True)
+            p.text("[ND]\n")
+            p.set(align='center', bold=False, custom_size=True, width=1, height=1, smooth=False)
+        elif comprobante.cadena_para_codigo_qr:
             p.qr(comprobante.cadena_para_codigo_qr, size=6)
         else:
             p.qr(f"{EMP_CONFIG['ruc']}|{comprobante.tipo_comprobante}|{comprobante.numeracion_comprobante}", size=6)
@@ -195,12 +231,16 @@ def imprimir_comprobante(comprobante, items, receptor, usuario):
             p.text(f"Hash: {comprobante.codigo_hash[:20]}...\n")
         else:
             p.text("Hash: JIiuNpvquEH36J7wZ0f8emtHWNE=...\n")
-        
+
+        if comprobante.tipo_comprobante == 'FACTURA ELECTRONICA':
+            p.text("\nDescargue su comprobante aqui:\n")
+            p.text("https://comprobantes.peru-hub.com/\n")
+
         p.cut()
 
         if p.device:
             from usb.util import dispose_resources
-            dispose_resources(p.device)        
+            dispose_resources(p.device)
         return True
     except Exception as e:
         print(f"Error físico de impresión: {e}")
@@ -212,10 +252,10 @@ def imprimir_comprobante(comprobante, items, receptor, usuario):
 def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, despachos):
     # , "%Y-%m-%d %H:%M:%S"
     p = None
-    dt_obj = datetime.fromisoformat(cierre.fecha)  
-    fecha_cierre = dt_obj.strftime("%d %B %Y %H:%M:%S")
-    dt_obj_inicio = datetime.fromisoformat(cierre.fecha_inicio) 
-    fecha_inicio = dt_obj_inicio.strftime("%d %B %Y %H:%M:%S")
+    dt_obj = datetime.fromisoformat(cierre.fecha)
+    fecha_cierre = formatear_fecha(dt_obj)
+    dt_obj_inicio = datetime.fromisoformat(cierre.fecha_inicio)
+    fecha_inicio = formatear_fecha(dt_obj_inicio)
     try:
         sum_depositos = sum(float(d.monto) for d in depositos)
         sum_gastos = sum(float(g.monto) for g in gastos)
@@ -226,15 +266,15 @@ def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, d
         p.text("REPORTE DE CIERRE DE TURNO\n")
         p.text(f"{EMP_CONFIG['rs']}\n")
         p.text("-" * MAX_SIZE + "\n")
-        
+
         p.set(align='left', bold=False)
-        
+
         p.text(f"TURNO: {cierre.turno}   ISLA: {cierre.isla}\n")
-        p.text(f"USUARIO: {usuario.nombre}\n")        
+        p.text(f"USUARIO: {usuario.nombre}\n")
         p.text(f"INICIO: {fecha_inicio}\n")
         p.text(f"FIN: {fecha_cierre}\n")
         p.text("-" * MAX_SIZE + "\n")
-        
+
         # Encabezados de detalle
         p.set(align='center', bold=True)
         p.text("CIERRE DE PRODUCTOS\n")
@@ -245,9 +285,10 @@ def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, d
             cant = f"{float(d.total_cantidad):>9.2f}"
             soles = f"{float(d.total_soles):>9.2f}"
             p.text(f"{prod} {cant} {soles}\n")
-            # Si hay calibración, mostrarla debajo
-            if float(d.calibracion_cantidad) > 0:
+            # Calibración y despacho son independientes: cada uno se muestra si existe
+            if float(d.calibracion_cantidad or 0) > 0:
                 p.text(f"  (Calib: -{d.calibracion_cantidad})\n")
+            if float(d.despacho_cantidad or 0) > 0:
                 p.text(f"  (Despa: -{d.despacho_cantidad})\n")
 
         p.text("-" * MAX_SIZE + "\n")
@@ -260,7 +301,7 @@ def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, d
             cant = f"{float(de.volumen):>9.2f}"
             soles = f"{float(de.total):>9.2f}"
             cliente = de.razon_social[:11].ljust(11)
-            prod = de.nombre[:8].ljust(8)            
+            prod = de.nombre[:8].ljust(8)
             p.text(f"{cliente} {prod} {cant} {soles}\n")
 
         # --- SECCIÓN DE DEPÓSITOS ACTUALIZADA ---
@@ -276,7 +317,7 @@ def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, d
                 f_dep = dt_dep.strftime("%d/%m %H:%M") # Formato corto "20/05 21:15"
             except Exception:
                 f_dep = str(d.fecha)[:11] # Fallback si no se puede parsear
-                
+
             concepto = d.concepto[:15].ljust(16)
             fecha_str = f_dep.ljust(12)
             monto = f"{float(d.monto):>9.2f}"
@@ -295,11 +336,11 @@ def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, d
                 f_gas = dt_gas.strftime("%d/%m %H:%M")
             except Exception:
                 f_gas = str(g.fecha)[:11]
-                
+
             concepto = g.concepto[:15].ljust(16)
             fecha_str = f_gas.ljust(12)
             monto = f"{float(g.monto):>9.2f}"
-            p.text(f"{concepto} {fecha_str} {monto}\n")            
+            p.text(f"{concepto} {fecha_str} {monto}\n")
 
         p.text("-" * MAX_SIZE + "\n")
         p.set(align='right')
@@ -318,7 +359,7 @@ def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, d
 
         if p.device:
             from usb.util import dispose_resources
-            dispose_resources(p.device)        
+            dispose_resources(p.device)
         return True
     except Exception as e:
         print(f"Error impresion turno: {e}")
@@ -333,7 +374,7 @@ def imprimir_ticket_cierre_dia(dia):
         # 1. Obtener conexión
         conn = obtener_conexion()
         cursor = conn.cursor()
-        
+
         # --- CONSULTA 1: Resumen de Ventas por Producto (Consolidado) ---
         query_productos = """
             SELECT ctd.producto, SUM(ctd.total_cantidad) as cant, SUM(ctd.total_soles) as soles
@@ -380,7 +421,7 @@ def imprimir_ticket_cierre_dia(dia):
 
         # --- CONSULTA 5: Consolidado de Medios de Pago ---
         query_pagos = """
-            SELECT 
+            SELECT
                 SUM(ISNULL(efectivo, 0)) as total_efectivo,
                 SUM(ISNULL(tarjeta, 0)) as total_tarjeta,
                 SUM(ISNULL(yape, 0)) as total_yape
@@ -389,7 +430,7 @@ def imprimir_ticket_cierre_dia(dia):
         """
         cursor.execute(query_pagos, dia.id)
         pagos = cursor.fetchone()
-        
+
         # Formatear la fecha para el ticket
         try:
             dt_obj = datetime.fromisoformat(str(dia.fecha))
@@ -399,21 +440,21 @@ def imprimir_ticket_cierre_dia(dia):
 
         # 2. Inicializar Impresora Epson
         p = Usb(ID_VENDOR, ID_PRODUCT, profile="TM-T88V")
-        
+
         # --- ENCABEZADO CORPORATIVO ---
         p.set(align='center', bold=True)
         p.text(f"{EMP_CONFIG['rs']}\n")
         p.text(f"RUC: {EMP_CONFIG['ruc']}\n")
         p.text("-" * MAX_SIZE + "\n")
-        
+
         p.set(align='center', bold=True, width=1, height=2)
         p.text("X - CIERRE CONSOLIDADO DIARIO\n")
-        
+
         p.set(align='left', bold=False, width=1, height=1)
         p.text(f"FECHA EMISION : {fecha_formateada}\n")
         p.text(f"CIERRE DIA ID : {dia.id}\n")
         p.text("-" * MAX_SIZE + "\n")
-        
+
         # --- SECCIÓN 1: RESUMEN DE VENTAS GENERALES ---
         p.set(align='center', bold=True)
         p.text("[ RESUMEN DE PRODUCTOS ]\n\n")
@@ -426,7 +467,7 @@ def imprimir_ticket_cierre_dia(dia):
             soles    = f"{float(prod.soles):>11.2f}"
             p.text(f"{nom_prod} {cantidad} {soles}\n")
         p.text("-" * MAX_SIZE + "\n")
-        
+
         # --- SECCIÓN 2: DESGLOSE DE TOTALES POR TURNO ---
         p.set(align='center', bold=True)
         p.text("[ RESUMEN DE TURNOS ]\n\n")
@@ -469,18 +510,18 @@ def imprimir_ticket_cierre_dia(dia):
                 sum_total_gastos += float(gas.total_monto)
                 p.text(f"{concepto} {monto}\n")
             p.text("-" * MAX_SIZE + "\n")
-        
+
         # --- SECCIÓN 5: CONSOLIDADO FINANCIERO (RESUMEN DE CAJAS) ---
         if pagos:
             p.set(align='center', bold=True)
             p.text("[ CONSOLIDADO FINANCIERO ]\n\n")
             p.set(align='left', bold=False)
-            
+
             efectivo  = pagos.total_efectivo if pagos.total_efectivo else 0.0
             tarjeta   = pagos.total_tarjeta if pagos.total_tarjeta else 0.0
             yape      = pagos.total_yape if pagos.total_yape else 0.0
             sub_pagos = efectivo + tarjeta + yape
-            
+
             p.text(f"TOTAL EFECTIVO     : S/ {float(efectivo):>12.2f}\n")
             p.text(f"TOTAL TARJETA      : S/ {float(tarjeta):>12.2f}\n")
             p.text(f"TOTAL YAPE/PLIN    : S/ {float(yape):>12.2f}\n")
@@ -489,35 +530,35 @@ def imprimir_ticket_cierre_dia(dia):
             p.text(f"(-) TOTAL DEPOSITOS: S/ {float(sum_total_depositos):>12.2f}\n")
             p.text(f"(-) TOTAL GASTOS   : S/ {float(sum_total_gastos):>12.2f}\n")
             p.text("-" * MAX_SIZE + "\n")
-            
+
         # --- PIE DE TICKET (GRAN TOTAL NETO) ---
         p.set(align='right', bold=True, width=1, height=2)
         p.text(f"TOTAL NETO DIA: S/ {float(dia.total):.2f}\n\n")
-        
+
         p.set(align='center', bold=False, width=1, height=1)
         p.text("--- FIN DE REPORTE DIARIO ---\n")
         p.text("Uso exclusivo operativo e interno.\n\n\n")
-        
+
         p.cut()
 
         if p.device:
             from usb.util import dispose_resources
-            dispose_resources(p.device)        
+            dispose_resources(p.device)
         return True
 
     except Exception as e:
         print(f"❌ Error al generar ticket completo de cierre de día: {e}")
         return False
     finally:
-        if 'conn' in locals() and conn: 
+        if 'conn' in locals() and conn:
             conn.close()
-        if p: 
+        if p:
             del p
         time.sleep(1)
 # --- LANZADOR PRINCIPAL ---
 if __name__ == "__main__":
     print("--- INICIANDO SERVICIOS MULTI-HILO ---")
-    
+
     # Crear los hilos
     hilo_print = threading.Thread(target=proceso_impresion, name="HiloImpresion")
     hilo_cierres = threading.Thread(target=proceso_cierres, name="HiloCierres")
