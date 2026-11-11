@@ -2,3 +2,4 @@ pyodbc
 python-dotenv
 python-escpos
 pyusb
+qrcode

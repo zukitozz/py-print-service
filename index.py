@@ -5,6 +5,7 @@ import time
 import os
 import threading
 from dotenv import load_dotenv
+import qrcode
 from escpos.printer import Usb
 
 # Cargar configuración
@@ -32,12 +33,27 @@ INTERVALO_IMPRESION = int(os.getenv('INTERVALO_IMPRESION', 30)) # Cada 30 seg
 MAX_SIZE = int(os.getenv('MAX_SIZE', 40)) # Ancho máximo para impresión
 ISLAS = os.getenv('ISLAS')
 ISLA_CIERRE = os.getenv('ISLA_CIERRE')
+URL_COMPROBANTES = 'https://comprobantes.peru-hub.com/'
 
 MESES = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
 
 def formatear_fecha(dt_obj):
     return f"{dt_obj.day:02d} {MESES[dt_obj.month]} {dt_obj.year} {dt_obj.strftime('%H:%M:%S')}"
+
+def crear_impresora():
+    # PREVIEW=1 genera el ticket como HTML en la carpeta preview/ sin usar la impresora
+    if os.getenv('PREVIEW') == '1':
+        from impresora_preview import PreviewPrinter
+        return PreviewPrinter(profile="TM-T88V")
+    return Usb(ID_VENDOR, ID_PRODUCT, profile="TM-T88V")
+
+def imprimir_qr(p, contenido, size=5):
+    # p.qr() agrega saltos de linea antes y despues de la imagen; aqui se imprime pegado al texto
+    qr = qrcode.QRCode(version=None, box_size=size, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+    qr.add_data(contenido)
+    qr.make(fit=True)
+    p.image(qr.make_image().get_image().convert("RGB"))
 
 def obtener_conexion():
     return pyodbc.connect(
@@ -67,7 +83,7 @@ def proceso_impresion():
                 with lock_impresora:
                     print(f"📄 Imprimiendo: {comp.numeracion_comprobante}")
 
-                    cursor.execute("SELECT CASE WHEN tipo_documento = '0' THEN 'DNI' WHEN tipo_documento = '1' THEN 'CARNET DE EXTRANJERIA' WHEN tipo_documento = '4' THEN 'CARNET DE IDENTIDAD' WHEN tipo_documento = '6' THEN 'RUC' ELSE 'OTRO' END as tipo_documento, numero_documento, razon_social, direccion, correo FROM Receptores WHERE id = ?", comp.ReceptorId)
+                    cursor.execute("SELECT CASE WHEN tipo_documento = '1' THEN 'DNI' WHEN tipo_documento = '4' THEN 'CARNET DE EXTRANJERIA' WHEN tipo_documento = '6' THEN 'RUC' WHEN tipo_documento = '7' THEN 'PASAPORTE' WHEN tipo_documento = '0' THEN 'SIN RUC' ELSE 'OTRO' END as tipo_documento, numero_documento, razon_social, direccion, correo FROM Receptores WHERE id = ?", comp.ReceptorId)
                     receptor = cursor.fetchone()
                     cursor.execute("SELECT * FROM Items WHERE ComprobanteId = ?", comp.id)
                     items = cursor.fetchall()
@@ -165,7 +181,7 @@ def imprimir_comprobante(comprobante, items, receptor, usuario):
     fecha_hora = formatear_fecha(dt_obj)
     p = None
     try:
-        p = Usb(ID_VENDOR, ID_PRODUCT, profile="TM-T88V")
+        p = crear_impresora()
         # Encabezado de la Gasolinera
         p.set(align='center', bold=True, width=2, height=2)
         p.text(f"{EMP_CONFIG['rs']}\n")
@@ -212,7 +228,7 @@ def imprimir_comprobante(comprobante, items, receptor, usuario):
         p.set(align='right', bold=True)
         p.text(f"OP. GRAVADA: S/ {comprobante.gravadas:.2f}\n")
         p.text(f"IGV (18%):   S/ {comprobante.igv:.2f}\n")
-        p.text(f"TOTAL A PAGAR: S/ {comprobante.total:.2f}\n\n")
+        p.text(f"TOTAL A PAGAR: S/ {comprobante.total:.2f}\n")
 
         # Código QR y Hash
         p.set(align='center')
@@ -223,18 +239,16 @@ def imprimir_comprobante(comprobante, items, receptor, usuario):
             p.text("[ND]\n")
             p.set(align='center', bold=False, custom_size=True, width=1, height=1, smooth=False)
         elif comprobante.cadena_para_codigo_qr:
-            p.qr(comprobante.cadena_para_codigo_qr, size=6)
+            imprimir_qr(p, comprobante.cadena_para_codigo_qr)
         else:
-            p.qr(f"{EMP_CONFIG['ruc']}|{comprobante.tipo_comprobante}|{comprobante.numeracion_comprobante}", size=6)
+            imprimir_qr(p, f"{EMP_CONFIG['ruc']}|{comprobante.tipo_comprobante}|{comprobante.numeracion_comprobante}")
 
         if comprobante.codigo_hash:
             p.text(f"Hash: {comprobante.codigo_hash[:20]}...\n")
         else:
             p.text("Hash: JIiuNpvquEH36J7wZ0f8emtHWNE=...\n")
-
-        if comprobante.tipo_comprobante == 'FACTURA ELECTRONICA':
-            p.text("\nDescargue su comprobante aqui:\n")
-            p.text("https://comprobantes.peru-hub.com/\n")
+        p.text("Consulte y descargue su comprobante en:\n")
+        p.text(f"{URL_COMPROBANTES}\n")
 
         p.cut()
 
@@ -261,7 +275,7 @@ def imprimir_ticket_cierre_turno(cierre, usuario, detalles, depositos, gastos, d
         sum_gastos = sum(float(g.monto) for g in gastos)
         sum_gastos = sum(float(g.monto) for g in gastos)
         total_turno = float(cierre.total) - sum_depositos - sum_gastos
-        p = Usb(ID_VENDOR, ID_PRODUCT, profile="TM-T88V")
+        p = crear_impresora()
         p.set(align='center', bold=True)
         p.text("REPORTE DE CIERRE DE TURNO\n")
         p.text(f"{EMP_CONFIG['rs']}\n")
@@ -439,7 +453,7 @@ def imprimir_ticket_cierre_dia(dia):
             fecha_formateada = str(dia.fecha)
 
         # 2. Inicializar Impresora Epson
-        p = Usb(ID_VENDOR, ID_PRODUCT, profile="TM-T88V")
+        p = crear_impresora()
 
         # --- ENCABEZADO CORPORATIVO ---
         p.set(align='center', bold=True)
